@@ -1,20 +1,36 @@
 #ifndef NODE_CONVERT_H_62B23520_7C8E_11DE_8A39_0800200C9A66
 #define NODE_CONVERT_H_62B23520_7C8E_11DE_8A39_0800200C9A66
 
+
+
+
 #if defined(_MSC_VER) ||                                            \
     (defined(__GNUC__) && (__GNUC__ == 3 && __GNUC_MINOR__ >= 4) || \
      (__GNUC__ >= 4))  // GCC supports "pragma once" correctly since 3.4
 #pragma once
+
+
 #endif
+
+// IWYU pragma: private, include "yaml-cpp/yaml.h"
+// IWYU pragma: friend "yaml-cpp/.*"
+
 
 #include <array>
 #include <cmath>
 #include <limits>
 #include <list>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
 #include <sstream>
 #include <type_traits>
+#include <valarray>
 #include <vector>
+
+#if ((defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || __cplusplus >= 201703L)
+#include <string_view>
+#endif
 
 #include "yaml-cpp/binary.h"
 #include "yaml-cpp/node/impl.h"
@@ -22,12 +38,13 @@
 #include "yaml-cpp/node/node.h"
 #include "yaml-cpp/node/type.h"
 #include "yaml-cpp/null.h"
+#include "yaml-cpp/fptostring.h"
 
 
 namespace YAML {
 class Binary;
 struct _Null;
-template <typename T>
+template <typename T, typename Enable>
 struct convert;
 }  // namespace YAML
 
@@ -87,6 +104,20 @@ struct convert<char[N]> {
   static Node encode(const char* rhs) { return Node(rhs); }
 };
 
+#if ((defined(_MSVC_LANG) && _MSVC_LANG >= 201703L) || __cplusplus >= 201703L)
+template <>
+struct convert<std::string_view> {
+  static Node encode(std::string_view rhs) { return Node(std::string(rhs)); }
+
+  static bool decode(const Node& node, std::string_view& rhs) {
+    if (!node.IsScalar())
+      return false;
+    rhs = node.Scalar();
+    return true;
+  }
+};
+#endif
+
 template <>
 struct convert<_Null> {
   static Node encode(const _Null& /* rhs */) { return Node(); }
@@ -109,12 +140,21 @@ inner_encode(const T& rhs, std::stringstream& stream){
       stream << ".inf";
     }
   } else {
-    stream << rhs;
+    stream << FpToString(rhs, static_cast<size_t>(stream.precision()));
   }
 }
 
 template <typename T>
-typename std::enable_if<!std::is_floating_point<T>::value, void>::type
+typename std::enable_if<(std::is_same<T, unsigned char>::value ||
+                         std::is_same<T, signed char>::value), void>::type
+inner_encode(const T& rhs, std::stringstream& stream) {
+  stream << static_cast<int>(rhs);
+}
+
+template <typename T>
+typename std::enable_if<(!std::is_floating_point<T>::value &&
+                         !std::is_same<T, unsigned char>::value &&
+                         !std::is_same<T, signed char>::value), void>::type
 inner_encode(const T& rhs, std::stringstream& stream){
   stream << rhs;
 }
@@ -127,7 +167,7 @@ ConvertStreamTo(std::stringstream& stream, T& rhs) {
   if ((stream >> std::noskipws >> num) && (stream >> std::ws).eof()) {
     if (num >= (std::numeric_limits<T>::min)() &&
         num <= (std::numeric_limits<T>::max)()) {
-      rhs = (T)num;
+      rhs = static_cast<T>(num);
       return true;
     }
   }
@@ -143,6 +183,15 @@ ConvertStreamTo(std::stringstream& stream, T& rhs) {
   }
   return false;
 }
+
+// Rewrite a valid YAML 1.2 octal scalar ("0o14") to the stream-parseable "014".
+inline std::string NormalizeOctalPrefix(std::string s) {
+  if (s.size() > 2 && s[0] == '0' && (s[1] == 'o' || s[1] == 'O') &&
+      s.find_first_not_of("01234567", 2) == std::string::npos) {
+    s.erase(1, 1);
+  }
+  return s;
+}
 }
 
 #define YAML_DEFINE_CONVERT_STREAMABLE(type, negative_op)                  \
@@ -151,6 +200,7 @@ ConvertStreamTo(std::stringstream& stream, T& rhs) {
                                                                            \
     static Node encode(const type& rhs) {                                  \
       std::stringstream stream;                                            \
+      stream.imbue(std::locale::classic());                                \
       stream.precision(std::numeric_limits<type>::max_digits10);           \
       conversion::inner_encode(rhs, stream);                               \
       return Node(stream.str());                                           \
@@ -161,7 +211,8 @@ ConvertStreamTo(std::stringstream& stream, T& rhs) {
         return false;                                                      \
       }                                                                    \
       const std::string& input = node.Scalar();                            \
-      std::stringstream stream(input);                                     \
+      std::stringstream stream(conversion::NormalizeOctalPrefix(input));   \
+      stream.imbue(std::locale::classic());                                \
       stream.unsetf(std::ios::dec);                                        \
       if ((stream.peek() == '-') && std::is_unsigned<type>::value) {       \
         return false;                                                      \
@@ -251,6 +302,58 @@ struct convert<std::map<K, V, C, A>> {
   }
 };
 
+// std::unordered_map
+template <typename K, typename V, typename H, typename P, typename A>
+struct convert<std::unordered_map<K, V, H, P, A>> {
+  static Node encode(const std::unordered_map<K, V, H, P, A>& rhs) {
+    Node node(NodeType::Map);
+    for (const auto& element : rhs)
+      node.force_insert(element.first, element.second);
+    return node;
+  }
+
+  static bool decode(const Node& node, std::unordered_map<K, V, H, P, A>& rhs) {
+    if (!node.IsMap())
+      return false;
+
+    rhs.clear();
+    for (const auto& element : node)
+#if defined(__GNUC__) && __GNUC__ < 4
+      // workaround for GCC 3:
+      rhs[element.first.template as<K>()] = element.second.template as<V>();
+#else
+      rhs[element.first.as<K>()] = element.second.as<V>();
+#endif
+    return true;
+  }
+};
+
+// std::unordered_set
+template <typename T, typename H, typename P, typename A>
+struct convert<std::unordered_set<T, H, P, A>> {
+  static Node encode(const std::unordered_set<T, H, P, A>& rhs) {
+    Node node(NodeType::Sequence);
+    for (const auto& element : rhs)
+      node.push_back(element);
+    return node;
+  }
+
+  static bool decode(const Node& node, std::unordered_set<T, H, P, A>& rhs) {
+    if (!node.IsSequence())
+      return false;
+
+    rhs.clear();
+    for (const auto& element : node)
+#if defined(__GNUC__) && __GNUC__ < 4
+      // workaround for GCC 3:
+      rhs.insert(element.template as<T>());
+#else
+      rhs.insert(element.as<T>());
+#endif
+    return true;
+  }
+};
+
 // std::vector
 template <typename T, typename A>
 struct convert<std::vector<T, A>> {
@@ -335,6 +438,37 @@ struct convert<std::array<T, N>> {
     return node.IsSequence() && node.size() == N;
   }
 };
+
+
+// std::valarray
+template <typename T>
+struct convert<std::valarray<T>> {
+  static Node encode(const std::valarray<T>& rhs) {
+    Node node(NodeType::Sequence);
+    for (const auto& element : rhs) {
+      node.push_back(element);
+    }
+    return node;
+  }
+
+  static bool decode(const Node& node, std::valarray<T>& rhs) {
+    if (!node.IsSequence()) {
+      return false;
+    }
+
+    rhs.resize(node.size());
+    for (auto i = 0u; i < node.size(); ++i) {
+#if defined(__GNUC__) && __GNUC__ < 4
+      // workaround for GCC 3:
+      rhs[i] = node[i].template as<T>();
+#else
+      rhs[i] = node[i].as<T>();
+#endif
+    }
+    return true;
+  }
+};
+
 
 // std::pair
 template <typename T, typename U>

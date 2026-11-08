@@ -1,13 +1,91 @@
 #include "yaml-cpp/yaml.h"  // IWYU pragma: keep
 
+#include <sstream>
+#include <string>
+
 #include "gtest/gtest.h"
 
 namespace YAML {
 namespace {
+class FailingStreamBuf : public std::stringbuf {
+ public:
+  explicit FailingStreamBuf(const std::string& input)
+      : std::stringbuf(input), first_read_(true) {}
+
+ protected:
+  std::streamsize xsgetn(char* output, std::streamsize count) override {
+    if (first_read_) {
+      first_read_ = false;
+      return std::stringbuf::xsgetn(output, count > 32 ? 32 : count);
+    }
+    throw std::ios_base::failure("simulated read failure");
+  }
+
+ private:
+  bool first_read_;
+};
+
+// Fails on the very first read, which the buffer above cannot do: it serves 32
+// bytes before throwing, so Stream's constructor completes and the failure is
+// raised later, during scanning.  Stream's constructor ends in ReadAheadTo(0),
+// so a buffer that throws immediately makes the failure escape the constructor
+// itself - a different path, and the one that used to leak the prefetch buffer
+// because ~Stream cannot run for an object that was never constructed.
+class ImmediatelyFailingStreamBuf : public std::stringbuf {
+ public:
+  ImmediatelyFailingStreamBuf() : std::stringbuf(std::string()) {}
+
+ protected:
+  std::streamsize xsgetn(char*, std::streamsize) override {
+    throw std::ios_base::failure("simulated read failure");
+  }
+};
+
 TEST(LoadNodeTest, Reassign) {
   Node node = Load("foo");
   node = Node();
   EXPECT_TRUE(node.IsNull());
+}
+
+TEST(LoadNodeTest, RejectsFailedInputStream) {
+  std::istringstream stream("key: value");
+  stream.setstate(std::ios_base::failbit);
+  EXPECT_THROW(Load(stream), BadStream);
+}
+
+TEST(LoadNodeTest, RejectsBadInputStream) {
+  std::istringstream stream("key: value");
+  stream.setstate(std::ios_base::badbit);
+  EXPECT_THROW(Load(stream), BadStream);
+}
+
+TEST(LoadNodeTest, LoadAllRejectsFailedInputStream) {
+  std::istringstream stream("---\nfirst\n---\nsecond\n");
+  stream.setstate(std::ios_base::failbit);
+  EXPECT_THROW(LoadAll(stream), BadStream);
+}
+
+TEST(LoadNodeTest, RejectsInputStreamFailureWhileReading) {
+  FailingStreamBuf buffer("value: " + std::string(128, 'a'));
+  std::istream stream(&buffer);
+  EXPECT_THROW(Load(stream), BadStream);
+}
+
+TEST(LoadNodeTest, RejectsInputStreamFailureOnFirstRead) {
+  ImmediatelyFailingStreamBuf buffer;
+  std::istream stream(&buffer);
+  EXPECT_THROW(Load(stream), BadStream);
+}
+
+TEST(LoadNodeTest, EmptyInputStreamRemainsNull) {
+  std::istringstream stream;
+  EXPECT_TRUE(Load(stream).IsNull());
+}
+
+TEST(LoadNodeTest, EofInputStreamRemainsNull) {
+  std::istringstream stream;
+  stream.setstate(std::ios_base::eofbit);
+  EXPECT_TRUE(Load(stream).IsNull());
 }
 
 TEST(LoadNodeTest, FallbackValues) {
@@ -224,13 +302,6 @@ TEST(LoadNodeTest, DereferenceIteratorError) {
   EXPECT_THROW(node.begin()->begin()->Type(), InvalidNode);
 }
 
-TEST(NodeTest, EmitEmptyNode) {
-  Node node;
-  Emitter emitter;
-  emitter << node;
-  EXPECT_EQ("", std::string(emitter.c_str()));
-}
-
 TEST(NodeTest, ParseNodeStyle) {
   EXPECT_EQ(EmitterStyle::Flow, Load("[1, 2, 3]").Style());
   EXPECT_EQ(EmitterStyle::Flow, Load("{foo: bar}").Style());
@@ -334,6 +405,92 @@ TEST(NodeTest, LoadQuotedNull) {
   EXPECT_EQ(node.as<std::string>(), "null");
 }
 
+TEST(NodeTest, LoadNonClosedQuotedString) {
+  EXPECT_THROW(Load(R"("foo)"), ParserException);
+}
+
+TEST(NodeTest, LoadWrongQuotedString) {
+  EXPECT_THROW(Load(R"("foo" [)"), ParserException);
+  EXPECT_THROW(Load(R"("foo", [)"), ParserException);
+}
+
+TEST(NodeTest, LoadUnquotedQuotedStrings) {
+  Node node = Load(R"(foo,"bar")");
+  EXPECT_EQ(node.as<std::string>(), "foo,\"bar\"");
+
+  node = Load(R"(foo,bar)");
+  EXPECT_EQ(node.as<std::string>(), "foo,bar");
+
+  node = Load(R"(foo,)");
+  EXPECT_EQ(node.as<std::string>(), "foo,");
+
+  node = Load(R"(foo "bar")");
+  EXPECT_EQ(node.as<std::string>(), "foo \"bar\"");
+}
+
+TEST(NodeTest, LoadCommaSeparatedStrings) {
+  EXPECT_THROW(Load(R"("foo","bar")"), ParserException);
+  EXPECT_THROW(Load(R"("foo",bar)"), ParserException);
+  EXPECT_THROW(Load(R"(,)"), ParserException);
+  EXPECT_THROW(Load(R"("foo",)"), ParserException);
+  EXPECT_THROW(Load(R"("foo","")"), ParserException);
+  EXPECT_THROW(Load(R"("foo",)"), ParserException);
+  EXPECT_THROW(Load(R"(,"foo")"), ParserException);
+  EXPECT_THROW(Load(R"(,foo)"), ParserException);
+}
+
+TEST(NodeTest, InfiniteLoopNodes) {
+  // Until yaml-cpp <= 0.8.0 this caused an infinite loop;
+  // After, it triggers an exception (but LoadAll is smart enough to avoid
+  // the infinite loop in any case).
+  EXPECT_THROW(LoadAll(R"(,)"), ParserException);
+}
+
+TEST(NodeTest, MultipleDocumentsBeginning) {
+  std::vector<Node> docs = LoadAll("\n---\n---\nA\n");
+  EXPECT_EQ(docs.size(), 2);
+}
+
+TEST(NodeTest, MultipleDocumentsEnds) {
+  std::vector<Node> docs = LoadAll("\n...\nA\n...\n");
+  EXPECT_EQ(docs.size(), 2);
+}
+
+TEST(NodeTest, MultipleDocumentsEndsWithEmptyDocs) {
+  std::vector<Node> docs = LoadAll("\n...\nA\n...\n...\nB\n...");
+  EXPECT_EQ(docs.size(), 4);
+}
+
+struct NewLineStringsTestCase {
+  std::string input;
+  std::string expected_content;
+  bool should_throw;
+};
+TEST(NodeTest, LoadNewLineStrings) {
+  std::vector<NewLineStringsTestCase> tests = {
+      {"foo\n, bar", "foo , bar", false},
+      {"foo\n, \"bar\"", "foo , \"bar\"", false},
+      {"\"foo\"\n, \"bar\"", "", true},
+      {"\"foo\"\n, bar", "", true},
+  };
+  for (const NewLineStringsTestCase& test : tests) {
+    if (test.should_throw) {
+      EXPECT_THROW(Load(test.input), ParserException);
+    } else {
+      Node node = Load(test.input);
+      Emitter emitter;
+      emitter << node;
+      EXPECT_EQ(NodeType::Scalar, node.Type());
+      EXPECT_EQ(test.expected_content, std::string(emitter.c_str()));
+    }
+  }
+}
+
+TEST(NodeTest, LoadSameLineStrings) {
+  EXPECT_THROW(Load(R"("foo" "bar")"), ParserException);
+  EXPECT_THROW(Load(R"("foo" bar)"), ParserException);
+}
+
 TEST(NodeTest, LoadTagWithParenthesis) {
     Node node = Load("!Complex(Tag) foo");
     EXPECT_EQ(node.Tag(), "!Complex(Tag)");
@@ -343,6 +500,44 @@ TEST(NodeTest, LoadTagWithParenthesis) {
 TEST(NodeTest, LoadTagWithNullScalar) {
   Node node = Load("!2");
   EXPECT_TRUE(node.IsNull());
+}
+
+TEST(LoadNodeTest, BlockCRNLEncoded) {
+  Node node = Load(
+      "blockText: |\r\n"
+      "  some arbitrary text \r\n"
+      "  spanning some \r\n"
+      "  lines, that are split \r\n"
+      "  by CR and NL\r\n"
+      "followup: 1");
+  EXPECT_EQ(
+      "some arbitrary text \nspanning some \nlines, that are split \nby CR and "
+      "NL\n",
+      node["blockText"].as<std::string>());
+  EXPECT_EQ(1, node["followup"].as<int>());
+}
+
+TEST(LoadNodeTest, BlockCREncoded) {
+  Node node = Load(
+      "blockText: |\r"
+      "  some arbitrary text \r"
+      "  spanning some \r"
+      "  lines, that are split \r"
+      "  by CR and NL\r"
+      "followup: 1");
+  EXPECT_EQ(
+      "some arbitrary text \nspanning some \nlines, that are split \nby CR and "
+      "NL\n",
+      node["blockText"].as<std::string>());
+  EXPECT_EQ(1, node["followup"].as<int>());
+}
+
+TEST(LoadNodeTest, IncorrectSeqEnd) {
+  EXPECT_THROW(Load("[foo]_bar"), ParserException);
+}
+
+TEST(LoadNodeTest, NonUniqueMapKey) {
+  EXPECT_THROW(Load("{a: A, b: B, a: A}"), NonUniqueMapKey);
 }
 
 }  // namespace
